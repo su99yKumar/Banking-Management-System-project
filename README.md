@@ -2,26 +2,45 @@
 
 CS-513 System Software Mini Project — IIIT Bangalore
 
-## Features
-- TCP client/server communication
-- Concurrent clients using fork()
-- Customer balance, deposits, withdrawals and transfers
-- fcntl file locking and System V semaphores
-- Transaction logging and history
-- Loan applications and employee assignment
-- Customer, employee, manager and admin roles
-- Account activation/deactivation and feedback management
+A C-based banking management system demonstrating TCP sockets, fork-based concurrency, file locking, System V semaphores, transaction logging, role-based access and loan management.
+
+## Project Structure
+- `src/` — server, client and core modules
+- `include/` — header files
+- `demos/` — System Software concept demonstrations
+- `tests/` — test programs
+- `tools/` — standalone utilities
+- `data/examples/` — sample account data
 
 ## Build
-Run make to build the project. If needed, compile the server with:
+Run these commands from the repository root:
 
-gcc -std=c11 -Wall -Wextra -Wpedantic -g session_server.c bank_core.c loan_core.c user_store.c user_registry.c -o bank_session_server
+```bash
+make
+make demos
+make tools
+make test-bin
+```
 
-Compile the client with:
+## Run the server
+Create the local runtime account file, then start the server:
 
-gcc -std=c11 -Wall -Wextra -Wpedantic -g session_client_ops.c -o session_client_ops
+```bash
+cp data/examples/users_network_test.example.txt users_network_test.txt
+./bank_session_server
+```
 
-## Technical limitations
-- Concurrency uses fork(), not pthreads.
-- Updates spanning multiple files are not fully crash-atomic.
+Open another terminal in the same repository directory and run:
+
+```bash
+./session_client_ops
+```
+
+## System Software Concepts
+TCP sockets, fork-based concurrency, fcntl record locks, System V semaphores, race-condition prevention, deadlock handling and fsync.
+
+## Known Limitations
+- Concurrency uses processes via fork(), not pthreads.
+- Operations spanning multiple files are not fully crash-atomic.
 - Customer closure deactivates accounts to preserve transaction history.
+- Runtime credentials, registries, session locks and transaction logs should not be committed.
