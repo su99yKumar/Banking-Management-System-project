@@ -1,5 +1,5 @@
 
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include "bank_core.h"
 #include "loan_core.h"
@@ -19,7 +19,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #define SERVER_PORT 5053
@@ -230,6 +230,16 @@ static int refresh_users(void)
 static volatile sig_atomic_t stop_server = 0;
 static int transaction_semid = -1;
 
+/* Serialize shared-state command handlers while client sockets remain concurrent. */
+static pthread_mutex_t operation_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t clients_cond = PTHREAD_COND_INITIALIZER;
+static size_t active_clients = 0;
+
+struct client_thread_arg {
+    int client_fd;
+};
+
 union semun {
     int val;
     struct semid_ds *buf;
@@ -243,32 +253,9 @@ static void handle_stop_signal(int signal_number)
     stop_server = 1;
 }
 
-/* Reap exited client children to prevent zombie processes. */
-static void handle_sigchld(int signal_number)
-{
-    (void)signal_number;
-
-    int saved_errno = errno;
-
-    while (waitpid(-1, NULL, WNOHANG) > 0) {
-        /* Reap every child that has already exited. */
-    }
-
-    errno = saved_errno;
-}
-
 /* Install the server's signal handlers. */
 static int install_signal_handlers(void)
 {
-    struct sigaction child_action;
-    memset(&child_action, 0, sizeof(child_action));
-    child_action.sa_handler = handle_sigchld;
-    sigemptyset(&child_action.sa_mask);
-    child_action.sa_flags = SA_RESTART;
-
-    if (sigaction(SIGCHLD, &child_action, NULL) == -1)
-        return -1;
-
     struct sigaction stop_action;
     memset(&stop_action, 0, sizeof(stop_action));
     stop_action.sa_handler = handle_stop_signal;
@@ -450,7 +437,7 @@ static int acquire_session_lock(const struct User *user)
     lock.l_start = user->lock_offset;
     lock.l_len = 1;
 
-    while (fcntl(fd, F_SETLK, &lock) == -1) {
+    while (fcntl(fd, F_OFD_SETLK, &lock) == -1) {
         if (errno == EINTR)
             continue;
 
@@ -475,7 +462,7 @@ static int release_session_lock(int fd, const struct User *user)
     lock.l_start = user->lock_offset;
     lock.l_len = 1;
 
-    while (fcntl(fd, F_SETLK, &lock) == -1) {
+    while (fcntl(fd, F_OFD_SETLK, &lock) == -1) {
         if (errno == EINTR)
             continue;
 
@@ -679,6 +666,10 @@ static void handle_client(int client_fd)
     char password[64];
 
     const struct User *user = NULL;
+    struct User session_user;
+    char session_username[32] = {0};
+    char session_account_id[7] = {0};
+    char session_role[16] = {0};
     int session_lock_fd = -1;
 
     int result = recv_frame(client_fd, message, sizeof(message));
@@ -694,15 +685,36 @@ static void handle_client(int client_fd)
         goto cleanup;
     }
 
-    user = find_user(username);
+    /* Copy the identity while protected; do not retain pointers into shared registry arrays. */
+    pthread_mutex_lock(&operation_mutex);
+    const struct User *loaded_user = find_user(username);
+    if (loaded_user != NULL) {
+        (void)snprintf(session_username, sizeof(session_username), "%s",
+                       loaded_user->username);
+        (void)snprintf(session_account_id, sizeof(session_account_id), "%s",
+                       loaded_user->account_id);
+        (void)snprintf(session_role, sizeof(session_role), "%s",
+                       loaded_user->role);
+        session_user.username = session_username;
+        session_user.password = NULL;
+        session_user.account_id = session_account_id;
+        session_user.role = session_role;
+        session_user.lock_offset = loaded_user->lock_offset;
+        user = &session_user;
+    }
+    int password_ok = user != NULL &&
+                      user_store_password_matches(username, password) == 1;
+    pthread_mutex_unlock(&operation_mutex);
 
-    if (user == NULL || user_store_password_matches(username, password) != 1) {
+    if (!password_ok) {
         send_error(client_fd, "ERROR INVALID_CREDENTIALS");
         goto cleanup;
     }
 
     if (strcmp(user->role, "CUSTOMER") == 0) {
+        pthread_mutex_lock(&operation_mutex);
         int active = bank_account_is_active(ACCOUNT_FILE, user->account_id);
+        pthread_mutex_unlock(&operation_mutex);
         if (active != 1) {
             if (active == 0)
                 (void)send_error(client_fd, "ERROR ACCOUNT_DEACTIVATED");
@@ -715,7 +727,9 @@ static void handle_client(int client_fd)
     }
 
     if (strcmp(user->role, "CUSTOMER") == 0) {
+        pthread_mutex_lock(&operation_mutex);
         int active = bank_account_is_active(ACCOUNT_FILE, user->account_id);
+        pthread_mutex_unlock(&operation_mutex);
         if (active != 1) {
             if (active == 0)
                 (void)send_error(client_fd, "ERROR ACCOUNT_DEACTIVATED");
@@ -752,8 +766,8 @@ static void handle_client(int client_fd)
         goto cleanup;
     }
 
-    printf("User '%s' logged in with role %s (PID %ld)\n",
-           user->username, user->role, (long)getpid());
+    printf("User '%s' logged in with role %s (thread %lu)\n",
+           user->username, user->role, (unsigned long)pthread_self());
     fflush(stdout);
 
     for (;;) {
@@ -763,8 +777,8 @@ static void handle_client(int client_fd)
             break;
 
         if (result == -1) {
-            fprintf(stderr, "Child %ld: failed to receive command\n",
-                    (long)getpid());
+            fprintf(stderr, "Thread %lu: failed to receive command\n",
+                    (unsigned long)pthread_self());
             break;
         }
 
@@ -773,6 +787,9 @@ static void handle_client(int client_fd)
                 perror("ERROR: Cannot send logout response");
             break;
         }
+
+        /* Protect registry and file-backed command processing from other threads. */
+        pthread_mutex_lock(&operation_mutex);
 
         int is_apply =
             strncmp(message, "APPLY_LOAN ", 11) == 0;
@@ -1064,14 +1081,20 @@ static void handle_client(int client_fd)
         else if (is_list_users) {
             if (strcmp(user->role, "ADMIN") != 0) {
                 if (send_error(client_fd,
-                               "ERROR PERMISSION_DENIED") == -1)
+                               "ERROR PERMISSION_DENIED") == -1) {
+                    pthread_mutex_unlock(&operation_mutex);
                     break;
+                }
+                pthread_mutex_unlock(&operation_mutex);
                 continue;
             }
 
             if (build_user_directory(response, sizeof(response)) == -1) {
-                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1)
+                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1) {
+                    pthread_mutex_unlock(&operation_mutex);
                     break;
+                }
+                pthread_mutex_unlock(&operation_mutex);
                 continue;
             }
         }
@@ -1208,8 +1231,11 @@ static void handle_client(int client_fd)
 
             if (!lookup_allowed) {
                 if (send_error(client_fd,
-                               "ERROR PERMISSION_DENIED") == -1)
+                               "ERROR PERMISSION_DENIED") == -1) {
+                    pthread_mutex_unlock(&operation_mutex);
                     break;
+                }
+                pthread_mutex_unlock(&operation_mutex);
                 continue;
             }
 
@@ -1222,8 +1248,11 @@ static void handle_client(int client_fd)
                                     sizeof(response)) == -1) {
                 fprintf(stderr,
                         "ERROR: Account lookup processing failed\n");
-                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1)
+                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1) {
+                    pthread_mutex_unlock(&operation_mutex);
                     break;
+                }
+                pthread_mutex_unlock(&operation_mutex);
                 continue;
             }
         }
@@ -1233,8 +1262,11 @@ static void handle_client(int client_fd)
          */
         else if (is_transfer) {
             if (strcmp(user->role, "CUSTOMER") != 0) {
-                if (send_error(client_fd, "ERROR CUSTOMER_ONLY_COMMAND") == -1)
+                if (send_error(client_fd, "ERROR CUSTOMER_ONLY_COMMAND") == -1) {
+                    pthread_mutex_unlock(&operation_mutex);
                     break;
+                }
+                pthread_mutex_unlock(&operation_mutex);
                 continue;
             }
 
@@ -1245,8 +1277,11 @@ static void handle_client(int client_fd)
                                       sizeof(response),
                                       transaction_semid) == -1) {
                 fprintf(stderr, "ERROR: Transfer processing failed\\n");
-                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1)
+                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1) {
+                    pthread_mutex_unlock(&operation_mutex);
                     break;
+                }
+                pthread_mutex_unlock(&operation_mutex);
                 continue;
             }
         }
@@ -1262,8 +1297,11 @@ static void handle_client(int client_fd)
             if (is_transaction_history) {
                 if (strcmp(user->role, "CUSTOMER") != 0) {
                     if (send_error(client_fd,
-                                   "ERROR CUSTOMER_ONLY_COMMAND") == -1)
+                                   "ERROR CUSTOMER_ONLY_COMMAND") == -1) {
+                        pthread_mutex_unlock(&operation_mutex);
                         break;
+                    }
+                    pthread_mutex_unlock(&operation_mutex);
                     continue;
                 }
                 target_account_id = user->account_id;
@@ -1274,8 +1312,11 @@ static void handle_client(int client_fd)
                     strcmp(user->role, "ADMIN") == 0;
 
                 if (!passbook_allowed) {
-                    if (send_error(client_fd, "ERROR PERMISSION_DENIED") == -1)
+                    if (send_error(client_fd, "ERROR PERMISSION_DENIED") == -1) {
+                        pthread_mutex_unlock(&operation_mutex);
                         break;
+                    }
+                    pthread_mutex_unlock(&operation_mutex);
                     continue;
                 }
                 target_account_id = message + 9;
@@ -1287,8 +1328,11 @@ static void handle_client(int client_fd)
                                          sizeof(response),
                                          transaction_semid) == -1) {
                 fprintf(stderr, "ERROR: Transaction history processing failed\\n");
-                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1)
+                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1) {
+                    pthread_mutex_unlock(&operation_mutex);
                     break;
+                }
+                pthread_mutex_unlock(&operation_mutex);
                 continue;
             }
         }
@@ -1319,8 +1363,11 @@ static void handle_client(int client_fd)
         else if (is_apply || is_status) {
             if (strcmp(user->role, "CUSTOMER") != 0) {
                 if (send_error(client_fd,
-                               "ERROR CUSTOMER_ONLY_COMMAND") == -1)
+                               "ERROR CUSTOMER_ONLY_COMMAND") == -1) {
+                    pthread_mutex_unlock(&operation_mutex);
                     break;
+                }
+                pthread_mutex_unlock(&operation_mutex);
                 continue;
             }
 
@@ -1330,8 +1377,11 @@ static void handle_client(int client_fd)
                                      response,
                                      sizeof(response)) == -1) {
                 fprintf(stderr, "ERROR: Customer loan operation failed\n");
-                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1)
+                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1) {
+                    pthread_mutex_unlock(&operation_mutex);
                     break;
+                }
+                pthread_mutex_unlock(&operation_mutex);
                 continue;
             }
         }
@@ -1344,8 +1394,11 @@ static void handle_client(int client_fd)
         else {
             if (strcmp(user->role, "CUSTOMER") != 0) {
                 if (send_error(client_fd,
-                               "ERROR CUSTOMER_ONLY_COMMAND") == -1)
+                               "ERROR CUSTOMER_ONLY_COMMAND") == -1) {
+                    pthread_mutex_unlock(&operation_mutex);
                     break;
+                }
+                pthread_mutex_unlock(&operation_mutex);
                 continue;
             }
 
@@ -1356,11 +1409,16 @@ static void handle_client(int client_fd)
                                      sizeof(response),
                                      transaction_semid) == -1) {
                 fprintf(stderr, "ERROR: Banking command processing failed\n");
-                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1)
+                if (send_error(client_fd, "ERROR SERVER_ERROR") == -1) {
+                    pthread_mutex_unlock(&operation_mutex);
                     break;
+                }
+                pthread_mutex_unlock(&operation_mutex);
                 continue;
             }
         }
+
+        pthread_mutex_unlock(&operation_mutex);
 
         if (send_frame(client_fd, response) == -1) {
             perror("ERROR: Cannot send command response");
@@ -1373,6 +1431,25 @@ cleanup:
         if (release_session_lock(session_lock_fd, user) == -1)
             perror("ERROR: Cannot release session lock");
     }
+}
+
+/* One detached worker owns and closes exactly one client socket. */
+static void *client_thread_main(void *argument)
+{
+    struct client_thread_arg *client = argument;
+    int client_fd = client->client_fd;
+    free(client);
+
+    handle_client(client_fd);
+    close(client_fd);
+
+    pthread_mutex_lock(&clients_mutex);
+    if (active_clients > 0)
+        active_clients--;
+    if (active_clients == 0)
+        pthread_cond_broadcast(&clients_cond);
+    pthread_mutex_unlock(&clients_mutex);
+    return NULL;
 }
 
 /* Create the shared transaction-log semaphore with initial value 1. */
@@ -1497,32 +1574,49 @@ int main(void)
             break;
         }
 
-        pid_t child_pid = fork();
-
-        if (child_pid == -1) {
-            perror("ERROR: Cannot fork client handler");
+        struct client_thread_arg *client = malloc(sizeof(*client));
+        if (client == NULL) {
+            perror("ERROR: Cannot allocate client thread argument");
             close(client_fd);
             continue;
         }
+        client->client_fd = client_fd;
 
-        if (child_pid == 0) {
-            /* Child handles one client and must not inherit the listener. */
-            signal(SIGINT, SIG_DFL);
-            signal(SIGTERM, SIG_DFL);
-            signal(SIGCHLD, SIG_DFL);
-            stop_server = 0;
+        pthread_mutex_lock(&clients_mutex);
+        active_clients++;
+        pthread_mutex_unlock(&clients_mutex);
 
-            close(server_fd);
-            handle_client(client_fd);
+        pthread_t thread;
+        int thread_error = pthread_create(&thread, NULL,
+                                          client_thread_main, client);
+        if (thread_error != 0) {
+            errno = thread_error;
+            perror("ERROR: Cannot create client thread");
+            free(client);
             close(client_fd);
-            _exit(EXIT_SUCCESS);
+            pthread_mutex_lock(&clients_mutex);
+            active_clients--;
+            if (active_clients == 0)
+                pthread_cond_broadcast(&clients_cond);
+            pthread_mutex_unlock(&clients_mutex);
+            continue;
         }
 
-        /* Parent keeps the listener and serves other clients. */
-        close(client_fd);
+        thread_error = pthread_detach(thread);
+        if (thread_error != 0) {
+            errno = thread_error;
+            perror("ERROR: Cannot detach client thread");
+            (void)pthread_join(thread, NULL);
+        }
     }
 
     close(server_fd);
+
+    /* Keep shared IPC alive until every client worker has finished. */
+    pthread_mutex_lock(&clients_mutex);
+    while (active_clients != 0)
+        pthread_cond_wait(&clients_cond, &clients_mutex);
+    pthread_mutex_unlock(&clients_mutex);
 
     /*
      * Remove the shared semaphore when the parent server stops.

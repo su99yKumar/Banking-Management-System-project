@@ -2,45 +2,51 @@
 
 CS-513 System Software Mini Project — IIIT Bangalore
 
-A C-based banking management system demonstrating TCP sockets, fork-based concurrency, file locking, System V semaphores, transaction logging, role-based access and loan management.
+A C/POSIX file-backed banking simulation with a TCP server, pthread client-session workers, role-based commands, account transactions, loans, locking and persistent transaction logging.
 
-## Project Structure
-- `src/` — server, client and core modules
-- `include/` — header files
-- `demos/` — System Software concept demonstrations
-- `tests/` — test programs
-- `tools/` — standalone utilities
-- `data/examples/` — sample account data
+## Essential project files
 
-## Build
-Run these commands from the repository root:
+- `src/` — server, full command client, banking/loan/user modules
+- `include/` — interfaces for core modules
+- `tests/` — unit test, fixture and isolated integration smoke suite
+- `data/examples/` — safe sample account records for a local run
+- `docs/architecture.md` — architecture/component blueprint and conceptual domain model
+- `docs/test-report.md` — test scope, evidence and known limitations
+
+Standalone demos and utility executables are not required by the banking application and are excluded from the final project commit.
+
+## Build and tests
 
 ```bash
+make clean
 make
-make demos
-make tools
-make test-bin
+make test
+make test-integration
 ```
 
-## Run the server
-Create the local runtime account file, then start the server:
+`make test` runs the core test against a temporary copy of its fixture. `make test-integration` launches an isolated server using temporary runtime files and checks the main customer, employee, manager and administrator workflows. The integration suite uses `127.0.0.1:5053`; stop any other running server before starting it. The test data is discarded at the end.
+
+## Run locally
+
+From the repository root, create sample runtime data only for a new local demo:
 
 ```bash
 cp data/examples/users_network_test.example.txt users_network_test.txt
 ./bank_session_server
 ```
 
-Open another terminal in the same repository directory and run:
+In another terminal, from the same directory:
 
 ```bash
 ./session_client_ops
 ```
 
-## System Software Concepts
-TCP sockets, fork-based concurrency, fcntl record locks, System V semaphores, race-condition prevention, deadlock handling and fsync.
+The server uses relative paths. Keep runtime credentials, user registry, account data, loan records, feedback and transaction logs local; do not commit those files. The sample account records are not live user data.
 
-## Known Limitations
-- Concurrency uses processes via fork(), not pthreads.
-- Operations spanning multiple files are not fully crash-atomic.
-- Customer closure deactivates accounts to preserve transaction history.
-- Runtime credentials, registries, session locks and transaction logs should not be committed.
+## Synchronization design
+
+TCP connections are handled by pthread workers. The shared-operation pthread mutex serializes shared-state command processing. Record locks protect file records, while a System V semaphore coordinates shared transaction-log operations. File operations use POSIX/Linux system calls including `open`, `pread`, `pwrite`, `fcntl`, `fsync` and `close`.
+
+## Limitations
+
+Transfers lock both account records and attempt rollback on ordinary write failures, but the implementation does not include a complete write-ahead crash-recovery journal. Full crash-atomic ACID behavior is not claimed. This is an educational project, not production banking software.
