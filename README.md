@@ -47,6 +47,4 @@ The server uses relative paths. Keep runtime credentials, user registry, account
 
 TCP connections are handled by pthread workers. The shared-operation pthread mutex serializes shared-state command processing. Record locks protect file records, while a System V semaphore coordinates shared transaction-log operations. File operations use POSIX/Linux system calls including `open`, `pread`, `pwrite`, `fcntl`, `fsync` and `close`.
 
-## Limitations
 
-Transfers lock both account records and attempt rollback on ordinary write failures, but the implementation does not include a complete write-ahead crash-recovery journal. Full crash-atomic ACID behavior is not claimed. This is an educational project, not production banking software.
