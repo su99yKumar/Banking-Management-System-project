@@ -86,7 +86,17 @@ def main() -> int:
                 return 2
 
             def client(username: str, password: str, role: str, commands: list[str], label: str) -> str:
-                payload = "\n".join([username, password, *commands, "LOGOUT", ""])
+                role_choices = {
+                    "CUSTOMER": "1",
+                    "EMPLOYEE": "2",
+                    "MANAGER": "3",
+                    "ADMIN": "4",
+                }
+                if role not in role_choices:
+                    raise ValueError(f"Unknown test role: {role}")
+                payload = "\n".join(
+                    [role_choices[role], username, password, *commands, "LOGOUT", ""]
+                )
                 try:
                     p = subprocess.run([str(CLIENT)], input=payload, cwd=runtime,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -109,6 +119,15 @@ def main() -> int:
                 fb = pool.submit(client, "bob", "Bob123!", "CUSTOMER",
                                  ["DEPOSIT 0.01", "BALANCE"], "Concurrent Bob")
                 concurrent_alice, concurrent_bob = fa.result(), fb.result()
+            wrong_role = subprocess.run(
+                [str(CLIENT)],
+                input="\n".join(["4", "alice", "Alice123!", ""]),
+                cwd=runtime, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=12
+            ).stdout or ""
+            need("role menu rejects mismatched selection", wrong_role,
+                 "You selected ADMIN, but this account is registered as CUSTOMER.")
+            need("mismatched role session logs out", wrong_role, "Server response: BYE")
             need("Concurrent Alice deposit", concurrent_alice, "DEPOSIT_OK")
             need("Concurrent Bob deposit", concurrent_bob, "DEPOSIT_OK")
 

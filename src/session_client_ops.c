@@ -127,8 +127,47 @@ static int recv_frame(int fd, char *buffer, size_t capacity)
     return 1;
 }
 
+static const char *select_login_role(void)
+{
+    static const char *roles[] = {
+        "CUSTOMER", "EMPLOYEE", "MANAGER", "ADMIN"
+    };
+    char choice[16];
+
+    for (;;) {
+        printf("\n");
+        printf("========================================\n");
+        printf("       BANKING MANAGEMENT SYSTEM       \n");
+        printf("========================================\n");
+        printf("  1. Login as Customer\n");
+        printf("  2. Login as Employee\n");
+        printf("  3. Login as Manager\n");
+        printf("  4. Login as Admin\n");
+        printf("  5. Exit\n");
+        printf("========================================\n");
+
+        if (read_line("Enter your choice: ", choice, sizeof(choice)) == -1)
+            return NULL;
+
+        if (strcmp(choice, "5") == 0)
+            return NULL;
+
+        if (strlen(choice) == 1 && choice[0] >= '1' && choice[0] <= '4') {
+            const char *selected = roles[choice[0] - '1'];
+            printf("Selected login type: %s\n", selected);
+            return selected;
+        }
+
+        printf("Invalid choice. Please enter a number from 1 to 5.\n");
+    }
+}
+
 int main(void)
 {
+    const char *selected_role = select_login_role();
+    if (selected_role == NULL)
+        return EXIT_SUCCESS;
+
     int client_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (client_fd == -1) {
@@ -196,19 +235,47 @@ int main(void)
 
     printf("Server response: %s\n", response);
 
-    /*
-     * Accept LOGIN_OK and role-bearing responses such as
-     * LOGIN_OK ROLE=CUSTOMER and LOGIN_OK ROLE=MANAGER.
-     */
+    /* The server determines the actual authenticated role. */
     if (strncmp(response, "LOGIN_OK", 8) != 0 ||
         (response[8] != '\0' && response[8] != ' ')) {
         close(client_fd);
         return EXIT_SUCCESS;
     }
 
-    const char *role = strstr(response, "ROLE=");
-    if (role != NULL)
-        printf("Authenticated role: %s\n", role + 5);
+    const char *role_field = strstr(response, "ROLE=");
+    if (role_field == NULL) {
+        fprintf(stderr, "ERROR: Server did not provide an authenticated role.\n");
+        close(client_fd);
+        return EXIT_FAILURE;
+    }
+
+    char authenticated_role[16];
+    size_t role_length = strcspn(role_field + 5, " \r\n");
+
+    if (role_length == 0 || role_length >= sizeof(authenticated_role)) {
+        fprintf(stderr, "ERROR: Invalid authenticated role from server.\n");
+        close(client_fd);
+        return EXIT_FAILURE;
+    }
+
+    memcpy(authenticated_role, role_field + 5, role_length);
+    authenticated_role[role_length] = '\0';
+    printf("Authenticated role: %s\n", authenticated_role);
+
+    if (strcmp(authenticated_role, selected_role) != 0) {
+        fprintf(stderr,
+                "ERROR: You selected %s, but this account is registered as %s.\n",
+                selected_role, authenticated_role);
+
+        if (send_frame(client_fd, "LOGOUT") == 0) {
+            int logout_result = recv_frame(client_fd, response, sizeof(response));
+            if (logout_result == 1)
+                printf("Server response: %s\n", response);
+        }
+
+        close(client_fd);
+        return EXIT_FAILURE;
+    }
 
     printf("Logged in. Available commands:\n");
     printf("  BALANCE\n");
