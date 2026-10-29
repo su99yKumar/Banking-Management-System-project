@@ -26,6 +26,3 @@ The finalization script only commits/pushes if the build, unit test, integration
 
 Customer balance, deposit, withdrawal, transfer, self-transfer and insufficient-funds rejection, transaction history, loan application/status, feedback and password change; manager loan assignment, account activate/deactivate, feedback review and authorization; employee assigned loans, loan approval/rejection, passbook/account lookup, customer creation/modification/deactivation and authorization; administrator employee creation/modification/details/password reset/deletion, role management, customer modification and user listing; concurrent client requests and unique transaction IDs.
 
-## Known limitation
-
-The test suite covers normal operation paths and selected error/authorization cases. It does not prove crash recovery or full ACID atomicity for a transfer that is interrupted between account-file and transaction-log updates.
